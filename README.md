@@ -26,7 +26,7 @@
 | match_type |          匹配类型，可选值有All 全匹配， Regex 正则表达式  默认为All，如为默认值则可不加此配置项 |
 | content |            指令内容，如果是全匹配则要求语音识别内容和指令内容一致，正则表达式则为匹配有值则算通过 |
 | command_type |        命令类型，可选值有Shell和Wol，Shell则表示会将command通过ash执行，Wol则是发送wol数据包，command里填写目标机器的MAC |
-| command |             命令内容 |
+| command |             命令内容，支持content通过正则匹配到的内容作为command的参数 |
 | result_exec_type|    结果执行方式，默认为TTS，文本转语音, 可选值为Music，即将result的内容作为播放音乐的url传入 |
 | result |              如果是$开头则表示是通过json path从command的执行结果中提取指定的值，这就要求command的执行结果要是json |
 
