@@ -1,0 +1,22 @@
+port: 8082
+instructions:
+  - content: 打开PC
+    command_type: Wol
+    command: 3A:7C:3F:D5:1E:8B
+    result: 好的
+
+  - content: 关闭PC
+    command: curl --insecure -connect-timeout 2 -m 4 -s http://192.168.1.100:30000?pass=sdfscs
+    result: 已关闭
+
+  - match_type: Regex
+    content: 播放(.*)的歌$
+    command: curl --get --data-urlencode "keyword={p0}" –connect-timeout 2  http://192.168.2.102:3030/music # {p0}表示匹配到的第一个替换到这里,{p1} {p2}以此类推
+    result: $.url # $开头表示用json path获取值，需要command返回结果为json
+    result_exec_type: Music
+
+  - match_type: Regex
+    content: 播放(.*)
+    command: curl --get --data-urlencode "keyword={p0}" –connect-timeout 2  http://192.168.2.102:3030/music
+    result: $.url
+    result_exec_type: Music
