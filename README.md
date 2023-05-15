@@ -52,7 +52,15 @@ instructions:
 ```
 
 ## 原理
-通过每隔1s读取`/tmp/mico_aivs_lab/instruction.log`文件，看文件里是否有语音识别结果，
-如果有则先执行`ubus call mediaplayer player_play_operation  "{\"action\":\"pause\"}"`让小爱闭嘴,再把识别结果和配置文件中的指令进行匹配，匹配成功则执行对应的命令
+1. 通过每隔1s读取`/tmp/mico_aivs_lab/instruction.log`文件，看文件里是否有语音识别结果
+2. 如果有则先执行`ubus call mediaplayer player_play_operation  "{\"action\":\"pause\"}"`让小爱闭嘴
+3. 把识别结果和配置文件中的指令进行匹配，匹配成功则执行对应的命令
 
+## web api
+1. POST /tts {"text": ""}         
 
+text的值就是小爱会说的话
+
+2. POST /music/play {"url": ""}
+
+url就是小爱要放的音乐的url
