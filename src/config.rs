@@ -60,6 +60,7 @@ pub struct Instruction {
     pub command_type: CommandType,
     pub command: String,
     /// 执行结果 如果为$开头则为json path匹配，需要命令执行的返回结果为json
+    #[serde(default)]
     pub result: String,
     #[serde(default)]
     pub result_exec_type: ResultExecType,

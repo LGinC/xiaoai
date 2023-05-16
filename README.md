@@ -49,6 +49,9 @@ instructions:
     command: curl --get --data-urlencode "keyword={p0}" –connect-timeout 2  http://192.168.2.102:3030/music # {p0}表示匹配到的第一个替换到这里,{p1} {p2}以此类推
     result: $.url # $开头表示用json path获取值，需要command返回结果为json
     result_exec_type: Music
+
+  - content: 重启
+    command: reboot
 ```
 
 ## 原理

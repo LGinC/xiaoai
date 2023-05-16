@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::env;
 use std::fs::metadata;
 use std::fs::File;
-use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::str::FromStr;
@@ -55,7 +55,7 @@ async fn main() {
     //加载配置
     let config = serde_yaml::from_str::<config::Config>(
         &std::fs::read_to_string(&config_path)
-            .expect(&format!("Failed to read config file at {:?}", &config_path))
+            .expect(&format!("Failed to read config file at {:?}", &config_path)),
     )
     .expect("not correct format config");
     let mut regexes: HashMap<usize, Regex> = HashMap::new();
@@ -210,19 +210,18 @@ fn handle_command(params: Vec<String>, ins: &config::Instruction) {
     let is_json_path = ins.result.starts_with("$");
     let result = match is_json_path {
         true => match jsonpath::select_as_str(output.as_str(), &ins.result) {
-            Ok(s) => s,
+            Ok(s) => String::from_str(&s[1..s.len() - 1]).unwrap(),
             Err(_) => String::new(),
         },
         false => ins.result.clone(),
     };
-    let remove_brackets = &result[1..result.len()-1];
-    println!("result:{}", remove_brackets);
+    println!("result:{}", result);
     match ins.result_exec_type {
         config::ResultExecType::TTS => {
-            if let Err(_) = Command::new("ash").arg("-c").arg(format!("ubus call mibrain text_to_speech \"{{\\\"text\\\":\\\"{}\\\",\\\"save\\\":0}}\"", remove_brackets)).status(){};
+            if let Err(_) = Command::new("ash").arg("-c").arg(format!("ubus call mibrain text_to_speech \"{{\\\"text\\\":\\\"{}\\\",\\\"save\\\":0}}\"", result)).status(){};
         }
         config::ResultExecType::Music => {
-            if let Err(_) = Command::new("ash").arg("-c").arg(format!("ubus call mediaplayer player_play_url \"{{\\\"url\\\":\\\"{}\\\",\\\"type\\\":1}}\"", remove_brackets)).status(){};
+            if let Err(_) = Command::new("ash").arg("-c").arg(format!("ubus call mediaplayer player_play_url \"{{\\\"url\\\":\\\"{}\\\",\\\"type\\\":1}}\"", result)).status(){};
         }
     }
 }
