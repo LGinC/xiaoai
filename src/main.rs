@@ -72,7 +72,7 @@ async fn main() {
     loop {
         //日志文件不存在，稍等继续
         if !file_path.exists() {
-            sleep(Duration::from_secs(1));
+            sleep(Duration::from_millis(config.detect_interval));
             continue;
         }
         let new_size = metadata(file_path).unwrap().len();

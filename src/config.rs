@@ -2,10 +2,18 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// web服务监听端口
     pub port: u16,
+    /// 指令检测间隔 单位ms
+    #[serde(default = "default_interval")]
+    pub detect_interval: u64,
 
     #[serde(default)]
     pub instructions: Vec<Instruction>,
+}
+
+fn default_interval() -> u64 {
+    1000
 }
 
 #[derive(Debug, Deserialize)]
