@@ -67,3 +67,17 @@ text的值就是小爱会说的话
 2. POST /music/play {"url": ""}
 
 url就是小爱要放的音乐的url
+
+## 交叉编译
+首先需要安装docker或podman
+
+然后添加target aarch64-unknown-linux-musl
+`rustup target add  aarch64-unknown-linux-musl `
+
+安装cross
+`cargo install cross --git https://github.com/cross-rs/cross`
+
+安装完毕后需要新开终端，最后执行编译命令
+`cargo build --release --target  aarch64-unknown-linux-musl`
+
+cross会自行拉取镜像然后在容器中运行编译，最后得到的可执行程序就在`./target/aarch64-unknown-linux-musl/release`下
