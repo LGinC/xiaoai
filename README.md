@@ -47,7 +47,7 @@ exec /data/start.sh start
 | instruction_log |    原生 ASR 结果日志，默认 `/tmp/mico_aivs_lab/instruction.log` |
 | instructions |        指令集合 |
 | match_type |          匹配类型，可选值有All 全匹配， Regex 正则表达式  默认为All，如为默认值则可不加此配置项 |
-| content |            指令内容，如果是全匹配则要求语音识别内容和指令内容一致，正则表达式则为匹配有值则算通过 |
+| content |            指令内容。全匹配要求识别文本与指令一致；正则按整句匹配，括号捕获组依次填入 command 的 {p0}{p1}…。正则指令等最终识别结果再拦截 |
 | command_type |        命令类型，可选值有Shell和Wol，Shell则表示会将command通过ash执行，Wol则是发送wol数据包，command里填写目标机器的MAC |
 | command |             命令内容，支持content通过正则匹配到的内容作为command的参数 |
 | result_exec_type|    结果执行方式，默认为TTS，文本转语音, 可选值为Music，即将result的内容作为播放音乐的url传入 |
@@ -68,8 +68,8 @@ instructions:
     result: 已关闭
 
   - match_type: Regex
-    content: 播放(.*)的歌$
-    command: curl --get --data-urlencode "keyword={p0}" –connect-timeout 2  http://192.168.2.102:3030/music # {p0}表示匹配到的第一个替换到这里,{p1} {p2}以此类推
+    content: ^播放(.+)的歌$
+    command: curl --get --data-urlencode "keyword={p0}" –connect-timeout 2  http://192.168.2.102:3030/music # {p0}表示第 1 个捕获组,{p1} {p2}以此类推
     result: $.url # $开头表示用json path获取值，需要command返回结果为json
     result_exec_type: Music
 
@@ -80,7 +80,7 @@ instructions:
 ## 原理
 1. 固件原生 `mipns-*` 继续占用真实麦克风，负责唤醒词检测。
 2. 本程序代理 `speech.usock`：默认把音频转发给原生 `mico_aivs_lab`，使用音箱自带 ASR。
-3. 识别结果如果在 `instructions` 列表中，立即把发给原生小爱的麦克风输入改成静音并取消本轮原生对话，然后执行自定义命令。
+3. 识别结果如果在 `instructions` 列表中，立即把发给原生小爱的麦克风输入改成静音并取消本轮原生对话，然后执行自定义命令。全匹配可在部分识别时拦截；正则等到最终识别结果再拦截，避免宽模式提前截走。
 4. 识别结果不在列表中，保持转发，走原生小爱后续处理。
 
 音频链路：

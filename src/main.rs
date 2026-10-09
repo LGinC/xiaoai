@@ -142,6 +142,14 @@ async fn run_speech_loop(
                     continue;
                 }
 
+                let instruction = config
+                    .instructions
+                    .get(instruction_index as usize)
+                    .expect("matched instruction index is valid");
+                if !should_intercept(&instruction.match_type, asr.is_final) {
+                    continue;
+                }
+
                 info!(id = %asr.id, is_final = asr.is_final, "INTERCEPT text={text}");
                 if let Err(err) = speech.mute_native().await {
                     warn!("failed to mute native microphone input: {err:?}");
@@ -150,10 +158,6 @@ async fn run_speech_loop(
                 if handled.len() > 8 {
                     handled.pop_front();
                 }
-                let instruction = config
-                    .instructions
-                    .get(instruction_index as usize)
-                    .expect("matched instruction index is valid");
                 handle_command(params, instruction);
             }
         }
@@ -165,6 +169,14 @@ fn normalize_asr_text(text: &str) -> String {
         .trim_matches(|c: char| matches!(c, '。' | '！' | '？' | '.' | '!' | '?' | ',' | '，'))
         .trim()
         .to_string()
+}
+
+fn should_intercept(match_type: &config::MatchType, is_final: bool) -> bool {
+    match match_type {
+        config::MatchType::All => true,
+        // 部分识别里捕获组还会变，宽模式会提前截走更具体的规则
+        config::MatchType::Regex => is_final,
+    }
 }
 
 fn handle_command(params: Vec<String>, ins: &config::Instruction) {
@@ -254,12 +266,15 @@ pub fn not_include_instruction(
                 let re = regs
                     .get(&i)
                     .expect(format!("cannot get instruction index is {}", i).as_str());
-                let mut matches = Vec::new();
-                for cap in re.captures_iter(_text) {
-                    matches.push(cap.get(1).unwrap().as_str().to_string());
-                }
-                if matches.len() > 0 {
-                    return (i as i32, matches);
+                if let Some(cap) = re.captures(_text) {
+                    let params = (1..cap.len())
+                        .map(|g| {
+                            cap.get(g)
+                                .map(|m| m.as_str().trim().to_string())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    return (i as i32, params);
                 }
             }
         }
@@ -361,5 +376,88 @@ mod tests {
     fn strips_asr_punctuation() {
         assert_eq!(normalize_asr_text("打开PC。"), "打开PC");
         assert_eq!(normalize_asr_text("  关闭PC！ "), "关闭PC");
+    }
+
+    fn sample(match_type: MatchType, content: &str) -> Instruction {
+        Instruction {
+            match_type,
+            content: content.to_string(),
+            command_type: Default::default(),
+            command: "true".to_string(),
+            result: String::new(),
+            result_exec_type: Default::default(),
+        }
+    }
+
+    fn compiled(ins: &[Instruction]) -> HashMap<usize, Regex> {
+        ins.iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item.match_type, MatchType::Regex))
+            .map(|(i, item)| (i, Regex::new(&item.content).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn regex_fills_capture_groups_in_order() {
+        let ins = vec![sample(MatchType::Regex, r"从(.+)到(.+)$")];
+        let regs = compiled(&ins);
+        let (index, params) = not_include_instruction("从 客厅 到厨房", &ins, &regs);
+        assert_eq!(index, 0);
+        assert_eq!(params, vec!["客厅".to_string(), "厨房".to_string()]);
+    }
+
+    #[test]
+    fn regex_without_capture_group_matches() {
+        let ins = vec![sample(MatchType::Regex, r"^播放.+$")];
+        let regs = compiled(&ins);
+        let (index, params) = not_include_instruction("播放周杰伦", &ins, &regs);
+        assert_eq!(index, 0);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn regex_optional_group_does_not_panic() {
+        let ins = vec![sample(MatchType::Regex, r"^a(b)?c$")];
+        let regs = compiled(&ins);
+        let (index, params) = not_include_instruction("ac", &ins, &regs);
+        assert_eq!(index, 0);
+        assert_eq!(params, vec![String::new()]);
+    }
+
+    #[test]
+    fn regex_intercept_waits_for_final_result() {
+        assert!(should_intercept(&MatchType::All, false));
+        assert!(should_intercept(&MatchType::All, true));
+        assert!(!should_intercept(&MatchType::Regex, false));
+        assert!(should_intercept(&MatchType::Regex, true));
+    }
+
+    #[test]
+    fn example_config_music_regex() {
+        let config: crate::config::Config =
+            serde_yaml::from_str(include_str!("../config.yaml")).unwrap();
+        let regs = compiled(&config.instructions);
+        let hit = |text: &str| not_include_instruction(text, &config.instructions, &regs);
+
+        let (index, params) = hit("播放周杰伦的歌");
+        assert_eq!(index, 2);
+        assert_eq!(params, vec!["周杰伦".to_string()]);
+
+        let (index, params) = hit("播放周杰伦");
+        assert_eq!(index, 3);
+        assert_eq!(params, vec!["周杰伦".to_string()]);
+
+        let (index, _) = hit("播放");
+        assert_eq!(index, -1);
+
+        let (index, _) = hit("我不想播放音乐");
+        assert_eq!(index, -1);
+
+        let (index, _) = hit("帮我播放周杰伦的歌");
+        assert_eq!(index, -1);
+
+        let (index, params) = hit(&normalize_asr_text("播放周杰伦的歌。"));
+        assert_eq!(index, 2);
+        assert_eq!(params, vec!["周杰伦".to_string()]);
     }
 }
