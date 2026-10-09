@@ -5,7 +5,7 @@ use std::time::Duration;
 pub struct Config {
     /// web服务监听端口
     pub port: u16,
-    /// 读取原生 instruction.log 的间隔，单位 ms
+    /// inotify 不可用时轮询 instruction.log 的间隔，单位 ms
     #[serde(default = "default_interval")]
     pub detect_interval: u64,
     /// mipns 连接的 speech.usock，由本程序绑定

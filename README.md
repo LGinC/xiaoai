@@ -41,7 +41,7 @@ exec /data/start.sh start
 | 配置项 | 说明 |
 | --- | --- |
 | port |                web服务监听的端口，web服务会提供/tts和/music/play两个api |
-| detect_interval |     读取原生 ASR 日志的间隔，单位 ms，默认 200 |
+| detect_interval |     inotify 不可用时轮询原生 ASR 日志的间隔，单位 ms，默认 200 |
 | speech_socket |      mipns 使用的 Unix socket，由本程序绑定 |
 | native_speech_socket | 原生 mico_aivs_lab 的 speech socket，用于自带 ASR |
 | instruction_log |    原生 ASR 结果日志，默认 `/tmp/mico_aivs_lab/instruction.log` |
