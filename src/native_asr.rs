@@ -81,12 +81,12 @@ fn read_new_events(path: &PathBuf, size: &mut u64) -> std::io::Result<Vec<Native
                 continue;
             }
         };
-        let Some(text) = parsed.asr_text() else {
+        let Some(text) = parsed.asr_text().map(str::to_string) else {
             continue;
         };
         events.push(NativeAsrEvent {
             id: parsed.header.id,
-            text: text.to_string(),
+            text,
             is_final: parsed.payload.is_final,
         });
     }
