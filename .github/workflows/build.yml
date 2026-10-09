@@ -1,0 +1,135 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+permissions:
+  contents: write
+
+env:
+  RUST_TARGET: aarch64-unknown-linux-musl
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Test
+        run: cargo test
+
+      - name: Resolve version
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+            release_tag="$tag"
+            prerelease="false"
+          else
+            version="dev"
+            release_tag="dev"
+            prerelease="true"
+          fi
+          archive="xiaoai-${version}-aarch64-linux-musl.tar.gz"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set crate version
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          if echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$'; then
+            sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+          fi
+
+      - name: Build release binary
+        run: cross build --release --target "$RUST_TARGET"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          bin="target/${RUST_TARGET}/release/xiaoai"
+          test -f "$bin"
+          chmod +x "$bin" start.sh
+          mkdir -p dist/pkg
+          cp "$bin" start.sh config.yaml dist/pkg/
+          sed -i 's/\r$//' dist/pkg/start.sh
+          chmod +x dist/pkg/xiaoai dist/pkg/start.sh
+          tar -C dist/pkg -czf "dist/${{ steps.meta.outputs.archive }}" xiaoai start.sh config.yaml
+          ls -lh "dist/${{ steps.meta.outputs.archive }}"
+          file "$bin"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.archive }}
+          path: dist/${{ steps.meta.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          ARCHIVE: ${{ steps.meta.outputs.archive }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          asset="dist/${ARCHIVE}#${ARCHIVE}"
+
+          if [ "$PRERELEASE" = "true" ]; then
+            notes="$(printf 'Development build from `%s`.\n\n%s' "$SHA" "$(git log -1 --pretty=format:'%s')")"
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release upload "$RELEASE_TAG" "$asset" --clobber
+              gh release edit "$RELEASE_TAG" --notes "$notes" --prerelease --latest=false
+            else
+              gh release create "$RELEASE_TAG" "$asset" \
+                --title "dev" \
+                --notes "$notes" \
+                --prerelease \
+                --latest=false
+            fi
+          else
+            notes="$(printf 'xiaoai %s for aarch64-unknown-linux-musl.\n\nCommit: `%s`' "$VERSION" "$SHA")"
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release upload "$RELEASE_TAG" "$asset" --clobber
+            else
+              gh release create "$RELEASE_TAG" "$asset" \
+                --title "$RELEASE_TAG" \
+                --notes "$notes"
+            fi
+          fi

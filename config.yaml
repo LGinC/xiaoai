@@ -1,5 +1,8 @@
 port: 8082
-detect_interval: 500
+detect_interval: 200
+speech_socket: /tmp/mico_aivs_lab/usock/speech.usock
+native_speech_socket: /tmp/mico_aivs_lab/usock/speech.native.usock
+instruction_log: /tmp/mico_aivs_lab/instruction.log
 instructions:
   - content: 打开PC
     command_type: Wol

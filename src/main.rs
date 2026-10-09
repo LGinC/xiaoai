@@ -1,58 +1,50 @@
 use crate::config::Instruction;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fs::metadata;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::str::FromStr;
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::Arc;
 use tokio::task;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use warp::{hyper::StatusCode, Filter, Reply};
 extern crate jsonpath_lib as jsonpath;
 mod config;
+#[cfg(unix)]
+mod native_asr;
 mod recognize_result;
+#[cfg(unix)]
+mod speech;
 
 #[tokio::main]
 async fn main() {
-    // 定义 POST /tts 路由
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
+
     let tts_route = warp::path("tts")
         .and(warp::post())
         .and(warp::body::json())
         .and_then(handle_tts);
 
-    // 定义 POST /music/play 路由
     let music_route = warp::path("music")
         .and(warp::path("play"))
         .and(warp::post())
         .and(warp::body::json())
         .and_then(handle_music);
 
-    // 将两个路由合并为一个
     let routes = tts_route.or(music_route);
 
-    let file_path = std::path::Path::new("/tmp/mico_aivs_lab/instruction.log");
-    // let file_path = "./test/instruction.log";
-    let mut size: u64 = 0;
-    let queue_max_length = 5;
-    let mut queue: VecDeque<String> = VecDeque::with_capacity(queue_max_length);
-
-    // 获取可执行文件的路径
     let exe_path = env::current_exe().expect("Failed to get current executable path");
-
-    // 获取可执行文件所在的目录路径
     let exe_dir = exe_path
         .parent()
         .expect("Failed to get parent directory of executable");
-
-    // 构建 config.yaml 文件的完整路径
-    let config_path = exe_dir.join("config.yaml");
-    //加载配置
+    let config_path = env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| exe_dir.join("config.yaml"));
     let config = serde_yaml::from_str::<config::Config>(
         &std::fs::read_to_string(&config_path)
             .expect(&format!("Failed to read config file at {:?}", &config_path)),
@@ -64,104 +56,116 @@ async fn main() {
             regexes.insert(i, Regex::new(&ins.content.as_str()).unwrap());
         }
     }
-    println!("开始监听{}端口", config.port);
+
+    info!("开始监听{}端口", config.port);
     let server = warp::serve(routes).run(([0, 0, 0, 0], config.port));
     task::spawn(server);
-    // let server_handle = task::spawn(server);
-    println!("开始循环");
-    loop {
-        //日志文件不存在，稍等继续
-        if !file_path.exists() {
-            sleep(Duration::from_millis(config.detect_interval));
-            continue;
+
+    #[cfg(unix)]
+    {
+        if let Err(err) = run_speech_loop(config, regexes).await {
+            error!("speech loop stopped: {err:?}");
+            std::process::exit(1);
         }
-        let new_size = metadata(file_path).unwrap().len();
-        if size != new_size {
-            //判断文件大小是否有变化
-            size = new_size;
-            // println!("file changed");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (config, regexes);
+        info!("speech.usock loop requires Linux; HTTP API is running");
+        std::future::pending::<()>().await;
+    }
+}
 
-            let reader = BufReader::new(File::open(file_path).unwrap());
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let recognize_result: recognize_result::RecognizeResult =
-                        serde_json::from_str(&line).unwrap_or_default();
-                    if recognize_result.payload.is_final
-                        && recognize_result.header.namespace == "SpeechRecognizer"
-                        && recognize_result.header.name == "RecognizeResult"
-                    {
-                        // println!("{:?}", recognize_result.payload);
-                        //判断最近是否处理过
-                        if queue.contains(&recognize_result.header.id) {
-                            // println!("已处理请求 {}", recognize_result.header.id);
-                            continue;
-                        }
-                        //判断识别结果是否在指令列表内
-                        let (instruction_index, params) = not_include_instruction(
-                            &recognize_result.payload.results.first().unwrap().text,
-                            &config.instructions,
-                            &regexes,
+#[cfg(unix)]
+async fn run_speech_loop(
+    config: config::Config,
+    regexes: HashMap<usize, Regex>,
+) -> anyhow::Result<()> {
+    use crate::native_asr::spawn_instruction_log_watcher;
+    use crate::speech::{SpeechProxy, SpeechProxyEvent};
+
+    let config = Arc::new(config);
+    let regexes = Arc::new(regexes);
+    let mut proxy = SpeechProxy::bind(&config.speech_socket, &config.native_speech_socket).await?;
+    let speech = proxy.handle();
+    let mut asr_rx = spawn_instruction_log_watcher(
+        config.instruction_log.clone().into(),
+        config.detect_interval_duration(),
+    );
+    let mut handled: VecDeque<String> = VecDeque::with_capacity(8);
+
+    info!(
+        socket = %config.speech_socket,
+        native = %config.native_speech_socket,
+        log = %config.instruction_log,
+        "waiting for mipns wake word; native ASR passthrough enabled"
+    );
+
+    loop {
+        tokio::select! {
+            event = proxy.recv() => {
+                let Some(event) = event else {
+                    anyhow::bail!("speech.usock proxy stopped unexpectedly");
+                };
+                match event {
+                    SpeechProxyEvent::Registered { vendor, codec } => {
+                        info!(
+                            vendor,
+                            codec = codec.as_deref().unwrap_or("pcm16"),
+                            "mipns registered"
                         );
-                        //未匹配则跳过
-                        if instruction_index == -1 {
-                            continue;
-                        }
-
-                        let mut loop_count = 0;
-                        loop {
-                            if loop_count > 50 {
-                                break;
-                            }
-
-                            //获取是否为播放状态
-                            let output = Command::new("ash")
-                                .arg("-c")
-                                .arg("ubus call mediaplayer player_get_play_status")
-                                .output().expect("Failed to execute command ubus call mediaplayer player_play_operation");
-                            let output_text = String::from_utf8_lossy(&output.stdout);
-                            // println!("控制台输出: {}", output_text);
-                            let parsed_obj: Value = serde_json::from_str(&output_text).unwrap();
-                            let info_obj: Value = serde_json::from_str(
-                                parsed_obj.get("info").unwrap().as_str().unwrap(),
-                            )
-                            .unwrap();
-                            let play_status = info_obj.get("status").unwrap().as_i64().unwrap();
-                            if play_status != 1 {
-                                sleep(Duration::from_millis(300));
-                                loop_count += 1;
-                                continue;
-                            }
-
-                            if let Err(_) = Command::new("ash")
-                                .arg("-c")
-                                .arg("ubus call mediaplayer player_play_operation  {\\\"action\\\":\\\"pause\\\"}").status(){};
-                            break;
-                        }
-
-                        //开始执行命令
-                        handle_command(
-                            params,
-                            config.instructions.get(instruction_index as usize).unwrap(),
-                        );
-
-                        //处理完毕 将结果id加入队列避免重复处理
-                        queue.push_back(recognize_result.header.id);
-                        if queue.len() > queue_max_length {
-                            queue.pop_front();
-                        }
-                        // println!("queue len {}", queue.len());
                     }
+                    SpeechProxyEvent::Wake => {
+                        info!("WAKE native mipns");
+                    }
+                    SpeechProxyEvent::Fatal(message) => anyhow::bail!(message),
                 }
             }
+            asr = asr_rx.recv() => {
+                let Some(asr) = asr else {
+                    anyhow::bail!("native ASR watcher stopped");
+                };
+                if handled.contains(&asr.id) {
+                    continue;
+                }
+                let text = normalize_asr_text(&asr.text);
+                let (instruction_index, params) =
+                    not_include_instruction(&text, &config.instructions, &regexes);
+                if instruction_index == -1 {
+                    if asr.is_final {
+                        info!(id = %asr.id, "NATIVE_PASSTHROUGH text={text}");
+                    }
+                    continue;
+                }
+
+                info!(id = %asr.id, is_final = asr.is_final, "INTERCEPT text={text}");
+                if let Err(err) = speech.mute_native().await {
+                    warn!("failed to mute native microphone input: {err:?}");
+                }
+                handled.push_back(asr.id);
+                if handled.len() > 8 {
+                    handled.pop_front();
+                }
+                let instruction = config
+                    .instructions
+                    .get(instruction_index as usize)
+                    .expect("matched instruction index is valid");
+                handle_command(params, instruction);
+            }
         }
-        sleep(Duration::from_secs(1));
     }
-    // server_handle.await.unwrap();
+}
+
+fn normalize_asr_text(text: &str) -> String {
+    text.trim()
+        .trim_matches(|c: char| matches!(c, '。' | '！' | '？' | '.' | '!' | '?' | ',' | '，'))
+        .trim()
+        .to_string()
 }
 
 fn handle_command(params: Vec<String>, ins: &config::Instruction) {
     let mut command = ins.command.clone();
-    println!("command: {}", command);
+    info!("command: {}", command);
     if params.len() > 0 {
         let mut pd = HashMap::new();
         for (i, p) in params.iter().enumerate() {
@@ -176,7 +180,7 @@ fn handle_command(params: Vec<String>, ins: &config::Instruction) {
         }
     }
 
-    println!("执行命令：{}", command);
+    info!("执行命令：{}", command);
     let output = match ins.command_type {
         config::CommandType::Shell => {
             let cmd = Command::new("ash")
@@ -201,7 +205,7 @@ fn handle_command(params: Vec<String>, ins: &config::Instruction) {
         }
     };
 
-    println!("执行结果：{}", output.as_str());
+    info!("执行结果：{}", output.as_str());
 
     if ins.result.is_empty() {
         return;
@@ -215,7 +219,7 @@ fn handle_command(params: Vec<String>, ins: &config::Instruction) {
         },
         false => ins.result.clone(),
     };
-    println!("result:{}", result);
+    info!("result:{}", result);
     match ins.result_exec_type {
         config::ResultExecType::TTS => {
             if let Err(_) = Command::new("ash").arg("-c").arg(format!("ubus call mibrain text_to_speech \"{{\\\"text\\\":\\\"{}\\\",\\\"save\\\":0}}\"", result)).status(){};
@@ -312,5 +316,46 @@ impl Reply for ApiResult {
             warp::reply::with_status(warp::reply::json(&self), StatusCode::INTERNAL_SERVER_ERROR)
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Instruction, MatchType};
+
+    #[test]
+    fn matches_full_instruction() {
+        let ins = vec![Instruction {
+            match_type: MatchType::All,
+            content: "打开PC".to_string(),
+            command_type: Default::default(),
+            command: "true".to_string(),
+            result: String::new(),
+            result_exec_type: Default::default(),
+        }];
+        let (index, params) = not_include_instruction("打开PC", &ins, &HashMap::new());
+        assert_eq!(index, 0);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn skips_unmatched_instruction() {
+        let ins = vec![Instruction {
+            match_type: MatchType::All,
+            content: "打开PC".to_string(),
+            command_type: Default::default(),
+            command: "true".to_string(),
+            result: String::new(),
+            result_exec_type: Default::default(),
+        }];
+        let (index, _) = not_include_instruction("今天天气", &ins, &HashMap::new());
+        assert_eq!(index, -1);
+    }
+
+    #[test]
+    fn strips_asr_punctuation() {
+        assert_eq!(normalize_asr_text("打开PC。"), "打开PC");
+        assert_eq!(normalize_asr_text("  关闭PC！ "), "关闭PC");
     }
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1"
 jsonpath_lib = "0.3.0"
 regex = "1.8.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -12,4 +13,6 @@ serde_yaml = "0.9.21"
 strfmt = "0.2.4"
 wol-rs = "1.0.0"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 warp = "0.3"
