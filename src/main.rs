@@ -1,18 +1,22 @@
 use crate::config::Instruction;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::env;
 use std::process::Command;
 use std::str::FromStr;
+#[cfg(unix)]
 use std::sync::Arc;
 use tokio::task;
-use tracing::{error, info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 use warp::{hyper::StatusCode, Filter, Reply};
 extern crate jsonpath_lib as jsonpath;
 mod config;
-#[cfg(unix)]
 mod native_asr;
 mod recognize_result;
 #[cfg(unix)]

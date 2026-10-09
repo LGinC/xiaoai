@@ -1,18 +1,12 @@
-use std::ffi::CString;
 use std::fs::{metadata, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
-use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 use crate::recognize_result::RecognizeResult;
-
-const INOTIFY_HEARTBEAT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct NativeAsrEvent {
@@ -21,93 +15,12 @@ pub struct NativeAsrEvent {
     pub is_final: bool,
 }
 
+#[cfg(unix)]
 pub fn spawn_instruction_log_watcher(
     path: PathBuf,
-    interval: Duration,
-) -> mpsc::Receiver<NativeAsrEvent> {
-    let (tx, rx) = mpsc::channel(32);
-    tokio::spawn(async move {
-        if let Err(err) = watch_with_inotify(&path, interval, &tx).await {
-            warn!(error = %err, "inotify unavailable; falling back to polling");
-            watch_with_poll(&path, interval, tx).await;
-        }
-    });
-    rx
-}
-
-async fn watch_with_inotify(
-    path: &Path,
-    fallback: Duration,
-    tx: &mpsc::Sender<NativeAsrEvent>,
-) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "instruction log path has no parent",
-            )
-        })?;
-
-    while !parent.exists() {
-        tokio::time::sleep(fallback).await;
-    }
-
-    let mut watcher = InotifyWatch::new(path)?;
-    info!(path = %path.display(), "watching instruction.log with inotify");
-
-    let mut size: u64 = current_size(path);
-    let mut leftover = String::new();
-    let heartbeat = fallback.max(INOTIFY_HEARTBEAT);
-    loop {
-        tokio::select! {
-            readable = watcher.readable() => {
-                readable?;
-                watcher.drain_and_refresh()?;
-                if send_new_events(path, &mut size, &mut leftover, tx).await {
-                    return Ok(());
-                }
-            }
-            _ = tokio::time::sleep(heartbeat) => {
-                if send_new_events(path, &mut size, &mut leftover, tx).await {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-async fn watch_with_poll(path: &Path, interval: Duration, tx: mpsc::Sender<NativeAsrEvent>) {
-    let mut size: u64 = current_size(path);
-    let mut leftover = String::new();
-    loop {
-        if send_new_events(path, &mut size, &mut leftover, &tx).await {
-            return;
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-async fn send_new_events(
-    path: &Path,
-    size: &mut u64,
-    leftover: &mut String,
-    tx: &mpsc::Sender<NativeAsrEvent>,
-) -> bool {
-    match read_new_events(path, size, leftover) {
-        Ok(events) => {
-            for event in events {
-                if tx.send(event).await.is_err() {
-                    return true;
-                }
-            }
-        }
-        Err(err) => {
-            debug!(error = %err, path = %path.display(), "instruction log not ready")
-        }
-    }
-    false
+    interval: std::time::Duration,
+) -> tokio::sync::mpsc::Receiver<NativeAsrEvent> {
+    unix_watch::spawn(path, interval)
 }
 
 fn current_size(path: &Path) -> u64 {
@@ -165,88 +78,192 @@ fn read_new_events(
     Ok(events)
 }
 
-struct InotifyWatch {
-    async_fd: AsyncFd<OwnedFd>,
-    path: PathBuf,
-    file_wd: Option<i32>,
-}
+#[cfg(unix)]
+mod unix_watch {
+    use super::{current_size, read_new_events, NativeAsrEvent};
+    use std::ffi::CString;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
-impl InotifyWatch {
-    fn new(path: &Path) -> io::Result<Self> {
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let parent = path.parent().unwrap_or(Path::new("."));
-        add_watch(
-            owned.as_raw_fd(),
-            parent,
-            libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_MOVED_FROM,
-        )?;
-        let mut watcher = Self {
-            async_fd: AsyncFd::new(owned)?,
-            path: path.to_path_buf(),
-            file_wd: None,
-        };
-        watcher.refresh_file_watch()?;
-        Ok(watcher)
+    use tokio::io::unix::AsyncFd;
+    use tokio::sync::mpsc;
+    use tracing::{debug, info, warn};
+
+    const INOTIFY_HEARTBEAT: Duration = Duration::from_secs(2);
+
+    pub fn spawn(path: PathBuf, interval: Duration) -> mpsc::Receiver<NativeAsrEvent> {
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            if let Err(err) = watch_with_inotify(&path, interval, &tx).await {
+                warn!(error = %err, "inotify unavailable; falling back to polling");
+                watch_with_poll(&path, interval, tx).await;
+            }
+        });
+        rx
     }
 
-    async fn readable(&self) -> io::Result<()> {
-        let mut guard = self.async_fd.readable().await?;
-        guard.clear_ready();
-        Ok(())
-    }
-
-    fn drain_and_refresh(&mut self) -> io::Result<()> {
-        let mut buf = [0_u8; 4096];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.async_fd.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
+    async fn watch_with_inotify(
+        path: &Path,
+        fallback: Duration,
+        tx: &mpsc::Sender<NativeAsrEvent>,
+    ) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "instruction log path has no parent",
                 )
+            })?;
+
+        while !parent.exists() {
+            tokio::time::sleep(fallback).await;
+        }
+
+        let mut watcher = InotifyWatch::new(path)?;
+        info!(path = %path.display(), "watching instruction.log with inotify");
+
+        let mut size: u64 = current_size(path);
+        let mut leftover = String::new();
+        let heartbeat = fallback.max(INOTIFY_HEARTBEAT);
+        loop {
+            tokio::select! {
+                readable = watcher.readable() => {
+                    readable?;
+                    watcher.drain_and_refresh()?;
+                    if send_new_events(path, &mut size, &mut leftover, tx).await {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(heartbeat) => {
+                    if send_new_events(path, &mut size, &mut leftover, tx).await {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn watch_with_poll(path: &Path, interval: Duration, tx: mpsc::Sender<NativeAsrEvent>) {
+        let mut size: u64 = current_size(path);
+        let mut leftover = String::new();
+        loop {
+            if send_new_events(path, &mut size, &mut leftover, &tx).await {
+                return;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    async fn send_new_events(
+        path: &Path,
+        size: &mut u64,
+        leftover: &mut String,
+        tx: &mpsc::Sender<NativeAsrEvent>,
+    ) -> bool {
+        match read_new_events(path, size, leftover) {
+            Ok(events) => {
+                for event in events {
+                    if tx.send(event).await.is_err() {
+                        return true;
+                    }
+                }
+            }
+            Err(err) => {
+                debug!(error = %err, path = %path.display(), "instruction log not ready")
+            }
+        }
+        false
+    }
+
+    struct InotifyWatch {
+        async_fd: AsyncFd<OwnedFd>,
+        path: PathBuf,
+        file_wd: Option<i32>,
+    }
+
+    impl InotifyWatch {
+        fn new(path: &Path) -> io::Result<Self> {
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            let parent = path.parent().unwrap_or(Path::new("."));
+            add_watch(
+                owned.as_raw_fd(),
+                parent,
+                libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_DELETE | libc::IN_MOVED_FROM,
+            )?;
+            let mut watcher = Self {
+                async_fd: AsyncFd::new(owned)?,
+                path: path.to_path_buf(),
+                file_wd: None,
             };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
+            watcher.refresh_file_watch()?;
+            Ok(watcher)
+        }
+
+        async fn readable(&self) -> io::Result<()> {
+            let mut guard = self.async_fd.readable().await?;
+            guard.clear_ready();
+            Ok(())
+        }
+
+        fn drain_and_refresh(&mut self) -> io::Result<()> {
+            let mut buf = [0_u8; 4096];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        self.async_fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    return Err(err);
+                }
+                if n == 0 {
                     break;
                 }
-                return Err(err);
             }
-            if n == 0 {
-                break;
-            }
+            self.refresh_file_watch()
         }
-        self.refresh_file_watch()
+
+        fn refresh_file_watch(&mut self) -> io::Result<()> {
+            if self.path.exists() {
+                if self.file_wd.is_none() {
+                    self.file_wd = Some(add_watch(
+                        self.async_fd.as_raw_fd(),
+                        &self.path,
+                        libc::IN_MODIFY | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF,
+                    )?);
+                }
+            } else {
+                self.file_wd = None;
+            }
+            Ok(())
+        }
     }
 
-    fn refresh_file_watch(&mut self) -> io::Result<()> {
-        if self.path.exists() {
-            if self.file_wd.is_none() {
-                self.file_wd = Some(add_watch(
-                    self.async_fd.as_raw_fd(),
-                    &self.path,
-                    libc::IN_MODIFY | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF,
-                )?);
-            }
+    fn add_watch(fd: RawFd, path: &Path, mask: u32) -> io::Result<i32> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains interior nul")
+        })?;
+        let wd = unsafe { libc::inotify_add_watch(fd, c_path.as_ptr(), mask) };
+        if wd < 0 {
+            Err(io::Error::last_os_error())
         } else {
-            self.file_wd = None;
+            Ok(wd)
         }
-        Ok(())
-    }
-}
-
-fn add_watch(fd: RawFd, path: &Path, mask: u32) -> io::Result<i32> {
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains interior nul"))?;
-    let wd = unsafe { libc::inotify_add_watch(fd, c_path.as_ptr(), mask) };
-    if wd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(wd)
     }
 }
 
@@ -271,9 +288,9 @@ mod tests {
         let mut size = 0;
         let mut leftover = String::new();
 
-        write!(
-            file,
-            r#"{{"header":{{"dialog_id":"d","id":"1","name":"RecognizeResult","namespace":"SpeechRecognizer"}},"payload":{{"is_final":true,"results":[{{"text":"打开PC"}}]}}}"#
+        file.write_all(
+            r#"{"header":{"dialog_id":"d","id":"1","name":"RecognizeResult","namespace":"SpeechRecognizer"},"payload":{"is_final":true,"results":[{"text":"打开PC"}]}}"#
+                .as_bytes(),
         )
         .unwrap();
         file.flush().unwrap();
